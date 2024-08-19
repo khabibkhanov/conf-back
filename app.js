@@ -1,124 +1,147 @@
-const { Readable } = require('stream');
-const AssemblyAI = require('assemblyai');
-const SoxRecording = require('./sox.js'); // Assuming you have a SoxRecording utility
-const socket = require('socket.io');
+require('dotenv').config();
+const express = require('express');
 const http = require('http');
+const { Server } = require('socket.io');
+const axios = require('axios');
+const FormData = require('form-data');
 
-// Create a simple HTTP server
-const server = http.createServer((req, res) => {
-    res.writeHead(200);
-    res.end('Server is running');
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
 });
 
-const SAMPLE_RATE = 16000;
-let currentSpeaker = null;0
-
-const io = socket(server);
+let broadcaster;
+const peerConnections = {};
 
 io.on('connection', (socket) => {
-    socket.on('join-room', (roomId) => {
-        socket.join(roomId);
-    });
+  console.log(`User connected: ${socket.id}`);
 
-    socket.on('start-speaking', (roomId) => {
-        if (currentSpeaker) {
-            socket.emit('error', 'Only one person can be the speaker.');
-            return;
-        }
+  socket.on('broadcaster', () => {
+    broadcaster = socket.id;
+    console.log(`Broadcaster registered: ${broadcaster}`);
+    socket.broadcast.emit('broadcaster');
+  });
 
-        currentSpeaker = socket.id; // Set the current speaker
+  socket.on('watcher', () => {
+    console.log(`Watcher connected: ${socket.id}`);
+    socket.to(broadcaster).emit('watcher', socket.id);
+  });
 
-        const client = new AssemblyAI({
-            apiKey: process.env.ASSEMBLYAI_API_KEY,
-        });
+  socket.on('offer', (id, message) => {
+    console.log(`Sending offer from ${socket.id} to ${id}`);
+    socket.to(id).emit('offer', socket.id, message);
+  });
 
-        const transcriber = client.realtime.transcriber({
-            sampleRate: SAMPLE_RATE,
-            enableDiarization: true, // Enable speaker diarization
-        });
+  socket.on('answer', (id, message) => {
+    console.log(`Sending answer from ${socket.id} to ${id}`);
+    socket.to(id).emit('answer', socket.id, message);
+  });
 
-        transcriber.on('open', ({ sessionId }) => {
-            console.log(`Session opened with ID: ${sessionId}`);
-        });
+  socket.on('candidate', (id, message) => {
+    console.log(`Sending ICE candidate from ${socket.id} to ${id}`);
+    socket.to(id).emit('candidate', socket.id, message);
+  });
 
-        transcriber.on('error', (error) => {
-            console.error('Error:', error);
-            socket.emit('error', 'Speech-to-text failed.');
-        });
+  socket.on('disconnect', () => {
+    console.log(`User disconnected: ${socket.id}`);
+    socket.to(broadcaster).emit('disconnectPeer', socket.id);
+  });
 
-        transcriber.on('close', (code, reason) => {
-            console.log('Session closed:', code, reason);
-            currentSpeaker = null; // Reset the speaker when done
-        });
+  socket.on('startSpeaking', async (audioBuffer) => {
+    console.log('Received audio for speech-to-text processing');
+    try {
+      const transcript = await speechToText(audioBuffer);
+      console.log('Transcript:', transcript);
+      io.emit('transcript', transcript);
+    } catch (error) {
+      console.error('Error in speech-to-text:', error);
+    }
+  });
 
-        transcriber.on('transcript', (transcript) => {
-            if (!transcript.text) return;
+  socket.on('translateSpeech', async (data) => {
+    const { text, targetLanguage } = data;
+    console.log(`Received text for translation: "${text}" to ${targetLanguage}`);
+    try {
+      const translatedText = await translateText(text, targetLanguage);
+      console.log(`Translated Text: "${translatedText}"`);
+      const audioUrl = await textToSpeech(translatedText, targetLanguage);
+      console.log('Generated audio URL:', audioUrl);
+      io.emit('translatedSpeech', { translatedText, audioUrl });
+    } catch (error) {
+      console.error('Error in translation or text-to-speech:', error);
+    }
+  });
+});
 
-            if (transcript.message_type === 'PartialTranscript') {
-                console.log('Partial:', transcript.text);
-            } else {
-                console.log('Final:', transcript.text);
-                io.to(roomId).emit('transcription', {
-                    text: transcript.text,
-                    speaker: transcript.speaker || 'Speaker',
-                });
-            }
-        });
+// Using AssemblyAI for speech-to-text
+const speechToText = async (audioBuffer) => {
+  const form = new FormData();
+  form.append('file', audioBuffer, { filename: 'speech.wav' });
 
-        (async () => {
-            console.log('Connecting to real-time transcript service');
-            await transcriber.connect();
+  const response = await axios.post('https://api.assemblyai.com/v2/upload', form, {
+    headers: {
+      authorization: process.env.ASSEMBLYAI_API_KEY,
+      ...form.getHeaders(),
+    }
+  });
 
-            console.log('Starting recording');
-            const recording = new SoxRecording({
-                channels: 1,
-                sampleRate: SAMPLE_RATE,
-                audioType: 'wav', // Linear PCM
-            });
+  console.log('Audio uploaded, received URL:', response.data.upload_url);
 
-            recording.stream().pipeTo(transcriber.stream());
+  const { upload_url: audioUrl } = response.data;
 
-            socket.on('stop-speaking', async () => {
-                console.log('Stopping recording');
-                recording.stop();
+  const transcriptResponse = await axios.post('https://api.assemblyai.com/v2/transcript', {
+    audio_url: audioUrl,
+  }, {
+    headers: {
+      authorization: process.env.ASSEMBLYAI_API_KEY,
+    }
+  });
 
-                console.log('Closing real-time transcript connection');
-                await transcriber.close();
+  console.log('Transcript response:', transcriptResponse.data);
 
-                currentSpeaker = null;
-            });
+  return transcriptResponse.data.text;
+};
 
-            socket.on('disconnect', async () => {
-                if (socket.id === currentSpeaker) {
-                    recording.stop();
-                    await transcriber.close();
-                    currentSpeaker = null;
-                }
-            });
+// Using LibreTranslate for translation
+const translateText = async (text, targetLanguage) => {
+  const response = await axios.post(`https://libretranslate.com/translate`, {
+    q: text,
+    source: "en",
+    target: targetLanguage,
+    format: "text"
+  });
 
-            process.on('SIGINT', async function () {
-                console.log();
-                console.log('Stopping recording');
-                recording.stop();
+  console.log('Translation response:', response.data);
 
-                console.log('Closing real-time transcript connection');
-                await transcriber.close();
+  return response.data.translatedText;
+};
 
-                process.exit();
-            });
-        })();
-    });
+// Using VoiceRSS for text-to-speech
+const textToSpeech = async (text, language) => {
+  const response = await axios.get('https://api.voicerss.org/', {
+    params: {
+      key: process.env.VOICERSS_API_KEY,
+      hl: language,
+      src: text,
+      c: 'MP3',
+      f: '48khz_16bit_stereo',
+      r: '0',
+    },
+    responseType: 'arraybuffer',
+  });
 
-    socket.on('start-listening', (roomId) => {
-        socket.join(roomId);
+  console.log('VoiceRSS response:', response.status);
 
-        socket.on('transcription', (data) => {
-            console.log(`Received from ${data.speaker}: ${data.text}`);
-            // Further processing such as translating or TTS can be done here
-        });
+  const audioBuffer = Buffer.from(response.data, 'binary');
+  const audioUrl = `data:audio/mp3;base64,${audioBuffer.toString('base64')}`;
 
-        socket.on('disconnect', () => {
-            socket.leave(roomId);
-        });
-    });
+  return audioUrl;
+};
+
+server.listen(3001, () => {
+  console.log('Server running on port 3001');
 });
