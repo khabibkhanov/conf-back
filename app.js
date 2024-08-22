@@ -1,147 +1,129 @@
-require('dotenv').config();
 const express = require('express');
 const http = require('http');
-const { Server } = require('socket.io');
-const axios = require('axios');
-const FormData = require('form-data');
+const socketIo = require('socket.io');
+const revai = require('revai-node-sdk');
+const { OpenAI } = require('openai');
+const cors = require('cors');
+require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
+const io = socketIo(server, {
   cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+    origin: '*', // Replace with your Next.js frontend URL
+    methods: ['GET', 'POST'],
+} 
 });
 
-let broadcaster;
-const peerConnections = {};
+// OpenAI setup
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+});
+
+// Rev.ai setup
+const revaiClient = new revai.RevAiApiClient({ token: process.env.REVAI_API_KEY });
+
+// CORS configuration
+app.use(cors({
+  origin: '*', // Replace with your Next.js frontend URL
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type'],
+}));
+
+// Store transcripts in-memory
+let transcripts = [];
 
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+    console.log('New client connected');
 
-  socket.on('broadcaster', () => {
-    broadcaster = socket.id;
-    console.log(`Broadcaster registered: ${broadcaster}`);
-    socket.broadcast.emit('broadcaster');
-  });
+    socket.on('start-stream', async ({ sourceLang }) => {
+        console.log(`Starting stream with source language: ${sourceLang}`);
+        
+        const stream = revaiClient.stream({ speaker_channels_count: 1 });
 
-  socket.on('watcher', () => {
-    console.log(`Watcher connected: ${socket.id}`);
-    socket.to(broadcaster).emit('watcher', socket.id);
-  });
+        stream.on('data', async (data) => {
+            console.log('Received data from Rev.ai');
+            
+            data.monologues.forEach(async (monologue) => {
+                const speakerId = monologue.speaker || 'Unknown';
+                const text = monologue.elements.map(e => e.value).join(' ');
+                const transcript = `Speaker ${speakerId}: ${text}`;
+                
+                console.log(`Transcript: ${transcript}`);
+                transcripts.push({ speakerId, text });
 
-  socket.on('offer', (id, message) => {
-    console.log(`Sending offer from ${socket.id} to ${id}`);
-    socket.to(id).emit('offer', socket.id, message);
-  });
+                // Send the original transcript to the speaker
+                socket.emit('speaker-transcription', { transcript });
 
-  socket.on('answer', (id, message) => {
-    console.log(`Sending answer from ${socket.id} to ${id}`);
-    socket.to(id).emit('answer', socket.id, message);
-  });
+                // Translate the text for the listener
+                const translatedText = await translateText(text, socket.listenerLang);
+                console.log(`Translated Text: ${translatedText}`);
+                
+                // Convert translated text to speech
+                const speech = await convertTextToSpeech(translatedText, socket.listenerLang);
+                console.log(`Generated Speech for listener`);
 
-  socket.on('candidate', (id, message) => {
-    console.log(`Sending ICE candidate from ${socket.id} to ${id}`);
-    socket.to(id).emit('candidate', socket.id, message);
-  });
+                socket.broadcast.emit('listener-transcription', { translatedText, speech });
+            });
+        });
 
-  socket.on('disconnect', () => {
-    console.log(`User disconnected: ${socket.id}`);
-    socket.to(broadcaster).emit('disconnectPeer', socket.id);
-  });
+        stream.on('error', (error) => {
+            console.error('Error during streaming:', error);
+            socket.emit('error', 'An error occurred during streaming.');
+        });
 
-  socket.on('startSpeaking', async (audioBuffer) => {
-    console.log('Received audio for speech-to-text processing');
-    try {
-      const transcript = await speechToText(audioBuffer);
-      console.log('Transcript:', transcript);
-      io.emit('transcript', transcript);
-    } catch (error) {
-      console.error('Error in speech-to-text:', error);
-    }
-  });
+        socket.on('audio-data', (audioData) => {
+            console.log('Received audio data');
+            stream.write(audioData);
+        });
 
-  socket.on('translateSpeech', async (data) => {
-    const { text, targetLanguage } = data;
-    console.log(`Received text for translation: "${text}" to ${targetLanguage}`);
-    try {
-      const translatedText = await translateText(text, targetLanguage);
-      console.log(`Translated Text: "${translatedText}"`);
-      const audioUrl = await textToSpeech(translatedText, targetLanguage);
-      console.log('Generated audio URL:', audioUrl);
-      io.emit('translatedSpeech', { translatedText, audioUrl });
-    } catch (error) {
-      console.error('Error in translation or text-to-speech:', error);
-    }
-  });
+        socket.on('stop-stream', () => {
+            console.log('Stopping stream');
+            stream.end();
+        });
+
+        socket.on('set-listener-lang', (lang) => {
+            console.log(`Listener language set to: ${lang}`);
+            socket.listenerLang = lang;
+        });
+    });
+
+    socket.on('disconnect', () => {
+        console.log('Client disconnected');
+    });
 });
 
-// Using AssemblyAI for speech-to-text
-const speechToText = async (audioBuffer) => {
-  const form = new FormData();
-  form.append('file', audioBuffer, { filename: 'speech.wav' });
-
-  const response = await axios.post('https://api.assemblyai.com/v2/upload', form, {
-    headers: {
-      authorization: process.env.ASSEMBLYAI_API_KEY,
-      ...form.getHeaders(),
+async function translateText(text, targetLang) {
+    try {
+        const response = await openai.createCompletion({
+            model: "text-davinci-003",
+            prompt: `Translate this to ${targetLang}: ${text}`,
+            max_tokens: 500,
+        });
+        return response.data.choices[0].text.trim();
+    } catch (error) {
+        console.error('Error translating text:', error);
+        throw new Error('Translation failed.');
     }
-  });
+}
 
-  console.log('Audio uploaded, received URL:', response.data.upload_url);
-
-  const { upload_url: audioUrl } = response.data;
-
-  const transcriptResponse = await axios.post('https://api.assemblyai.com/v2/transcript', {
-    audio_url: audioUrl,
-  }, {
-    headers: {
-      authorization: process.env.ASSEMBLYAI_API_KEY,
+async function convertTextToSpeech(text, language) {
+    try {
+        const response = await openai.createAudio({
+            model: "text-davinci-003",
+            input: text,
+            voice: {
+                language: language,
+                gender: 'female' // Adjust as needed
+            },
+            audioFormat: 'mp3'
+        });
+        return response.data.audio_data;
+    } catch (error) {
+        console.error('Error converting text to speech:', error);
+        throw new Error('Text-to-Speech conversion failed.');
     }
-  });
+}
 
-  console.log('Transcript response:', transcriptResponse.data);
-
-  return transcriptResponse.data.text;
-};
-
-// Using LibreTranslate for translation
-const translateText = async (text, targetLanguage) => {
-  const response = await axios.post(`https://libretranslate.com/translate`, {
-    q: text,
-    source: "en",
-    target: targetLanguage,
-    format: "text"
-  });
-
-  console.log('Translation response:', response.data);
-
-  return response.data.translatedText;
-};
-
-// Using VoiceRSS for text-to-speech
-const textToSpeech = async (text, language) => {
-  const response = await axios.get('https://api.voicerss.org/', {
-    params: {
-      key: process.env.VOICERSS_API_KEY,
-      hl: language,
-      src: text,
-      c: 'MP3',
-      f: '48khz_16bit_stereo',
-      r: '0',
-    },
-    responseType: 'arraybuffer',
-  });
-
-  console.log('VoiceRSS response:', response.status);
-
-  const audioBuffer = Buffer.from(response.data, 'binary');
-  const audioUrl = `data:audio/mp3;base64,${audioBuffer.toString('base64')}`;
-
-  return audioUrl;
-};
-
-server.listen(3001, () => {
-  console.log('Server running on port 3001');
-});
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
